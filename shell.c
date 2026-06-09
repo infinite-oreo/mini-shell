@@ -1,128 +1,174 @@
+/**
+ * [INPUT]: 依赖 POSIX 标准库 — unistd / sys/wait / fcntl
+ * [OUTPUT]: 可执行二进制 mysh，交互式 Unix shell
+ * [POS]: 项目唯一源文件，实现 parse / builtin / redirect / pipeline 四大核心能力
+ * [PROTOCOL]: 变更时更新此头部，然后检查 CLAUDE.md
+ */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 
 #define MAX_INPUT 1024
-#define MAX_ARGS 64
+#define MAX_ARGS  64
+#define MAX_CMDS  16
 
-void parse(char *input, char **args) {
+typedef struct { char *in, *out; int append; } Redir;
+
+/* ============================================================
+ * 解析
+ * ============================================================ */
+
+static void parse(char *input, char **args) {
     int i = 0;
-    char *token = strtok(input, " ");
-    while (token != NULL && i < MAX_ARGS - 1) {
-        args[i++] = token;
-        token = strtok(NULL, " ");
-    }
+    for (char *tok = strtok(input, " "); tok && i < MAX_ARGS-1; tok = strtok(NULL, " "))
+        args[i++] = tok;
     args[i] = NULL;
 }
 
-int builtin(char **args) {
-    if (strcmp(args[0], "exit") == 0) {
+/* ============================================================
+ * 重定向：从 args 中提取 < > >> 并将其从参数列表移除
+ * ============================================================ */
+
+static void extract_redir(char **args, Redir *r) {
+    *r = (Redir){0};
+    int i = 0, j = 0;
+    while (args[i]) {
+        if      (!strcmp(args[i], "<")  && args[i+1]) { r->in  = args[++i]; }
+        else if (!strcmp(args[i], ">>") && args[i+1]) { r->out = args[++i]; r->append = 1; }
+        else if (!strcmp(args[i], ">")  && args[i+1]) { r->out = args[++i]; }
+        else args[j++] = args[i];
+        i++;
+    }
+    args[j] = NULL;
+}
+
+static void apply_redir(const Redir *r) {
+    if (r->in) {
+        int fd = open(r->in, O_RDONLY);
+        if (fd < 0) { perror(r->in); exit(1); }
+        dup2(fd, STDIN_FILENO); close(fd);
+    }
+    if (r->out) {
+        int flags = O_WRONLY | O_CREAT | (r->append ? O_APPEND : O_TRUNC);
+        int fd = open(r->out, flags, 0644);
+        if (fd < 0) { perror(r->out); exit(1); }
+        dup2(fd, STDOUT_FILENO); close(fd);
+    }
+}
+
+/* ============================================================
+ * 内置命令
+ * ============================================================ */
+
+static int builtin(char **args) {
+    if (!strcmp(args[0], "exit")) {
         printf("再见！\n");
         exit(0);
     }
-    if (strcmp(args[0], "cd") == 0) {
-        if (args[1] == NULL) {
-            chdir(getenv("HOME"));
-        } else {
-            if (chdir(args[1]) != 0) {
-                printf("mysh: cd: 目录不存在: %s\n", args[1]);
-            }
-        }
+    if (!strcmp(args[0], "cd")) {
+        const char *dir = args[1] ? args[1] : getenv("HOME");
+        if (chdir(dir))
+            fprintf(stderr, "mysh: cd: 目录不存在: %s\n", dir);
+        return 1;
+    }
+    if (!strcmp(args[0], "pwd")) {
+        char cwd[MAX_INPUT];
+        if (getcwd(cwd, sizeof(cwd))) printf("%s\n", cwd);
         return 1;
     }
     return 0;
 }
 
-void execute(char **args) {
-    pid_t pid = fork();
-    if (pid == 0) {
-        if (execvp(args[0], args) == -1) {
-            printf("mysh: 命令未找到: %s\n", args[0]);
-            exit(1);
-        }
-    } else {
-        wait(NULL);
-    }
+/* ============================================================
+ * 执行
+ * ============================================================ */
+
+/* 在子进程中调用：提取重定向后 exec */
+static void run_cmd(char **args) {
+    Redir r;
+    extract_redir(args, &r);
+    apply_redir(&r);
+    execvp(args[0], args);
+    fprintf(stderr, "mysh: 命令未找到: %s\n", args[0]);
+    exit(1);
 }
 
-// 检查输入里有没有管道符，有就返回它的位置，没有返回-1
-int find_pipe(char **args) {
-    for (int i = 0; args[i] != NULL; i++) {
-        if (strcmp(args[i], "|") == 0) {
-            return i;
-        }
-    }
-    return -1;
-}
-
-void execute_pipe(char **args, int pipe_pos) {
-    // 把参数分成管道左边和右边
-    char **left = args;
-    char **right = args + pipe_pos + 1;
-    args[pipe_pos] = NULL;  // 在管道位置截断
-
-    int fd[2];
-    pipe(fd);  // 创建管道，fd[0]是读端，fd[1]是写端
-
-    pid_t pid1 = fork();
-    if (pid1 == 0) {
-        // 左边的命令：把输出写到管道
-        close(fd[0]);
-        dup2(fd[1], STDOUT_FILENO);  // 把标准输出重定向到管道写端
-        close(fd[1]);
-        if (execvp(left[0], left) == -1) {
-            printf("mysh: 命令未找到: %s\n", left[0]);
-            exit(1);
-        }
-    }
-
-    pid_t pid2 = fork();
-    if (pid2 == 0) {
-        // 右边的命令：从管道读输入
-        close(fd[1]);
-        dup2(fd[0], STDIN_FILENO);  // 把标准输入重定向到管道读端
-        close(fd[0]);
-        if (execvp(right[0], right) == -1) {
-            printf("mysh: 命令未找到: %s\n", right[0]);
-            exit(1);
-        }
-    }
-
-    // 父进程关闭管道，等待两个子进程结束
-    close(fd[0]);
-    close(fd[1]);
-    wait(NULL);
+static void execute(char **args) {
+    if (!fork()) run_cmd(args);
     wait(NULL);
 }
 
-int main() {
-    char input[MAX_INPUT];
+/* 按 | 分割参数段，构造任意长度的管道链 */
+static void execute_pipeline(char **args) {
+    char **cmds[MAX_CMDS];
+    int    ncmds = 0;
+    cmds[ncmds++] = args;
+    for (int i = 0; args[i]; i++)
+        if (!strcmp(args[i], "|")) { args[i] = NULL; cmds[ncmds++] = args + i + 1; }
+
+    int fds[MAX_CMDS-1][2];
+    for (int i = 0; i < ncmds-1; i++) pipe(fds[i]);
+
+    for (int i = 0; i < ncmds; i++) {
+        if (!fork()) {
+            if (i > 0)       dup2(fds[i-1][0], STDIN_FILENO);
+            if (i < ncmds-1) dup2(fds[i][1],   STDOUT_FILENO);
+            for (int j = 0; j < ncmds-1; j++) { close(fds[j][0]); close(fds[j][1]); }
+            run_cmd(cmds[i]);
+        }
+    }
+    for (int i = 0; i < ncmds-1; i++) { close(fds[i][0]); close(fds[i][1]); }
+    for (int i = 0; i < ncmds; i++) wait(NULL);
+}
+
+/* ============================================================
+ * 提示符：显示当前目录，$HOME 前缀替换为 ~
+ * ============================================================ */
+
+static void print_prompt(void) {
+    char cwd[MAX_INPUT], buf[MAX_INPUT];
+    if (!getcwd(cwd, sizeof(cwd))) { printf("mysh> "); return; }
+
+    const char *home    = getenv("HOME");
+    const char *display = cwd;
+    if (home && !strncmp(cwd, home, strlen(home))) {
+        snprintf(buf, sizeof(buf), "~%s", cwd + strlen(home));
+        display = buf;
+    }
+    printf("mysh:%s> ", display);
+}
+
+static int has_pipe(char **args) {
+    for (int i = 0; args[i]; i++)
+        if (!strcmp(args[i], "|")) return 1;
+    return 0;
+}
+
+/* ============================================================
+ * 主循环
+ * ============================================================ */
+
+int main(void) {
+    char  input[MAX_INPUT];
     char *args[MAX_ARGS];
 
     while (1) {
-        printf("mysh> ");
+        print_prompt();
         fflush(stdout);
 
-        if (fgets(input, MAX_INPUT, stdin) == NULL) {
-            break;
-        }
-
+        if (!fgets(input, MAX_INPUT, stdin)) break;
         input[strcspn(input, "\n")] = '\0';
-
-        if (strlen(input) == 0) continue;
+        if (!input[0]) continue;
 
         parse(input, args);
 
-        int pipe_pos = find_pipe(args);
-
-        if (pipe_pos != -1) {
-            execute_pipe(args, pipe_pos);
-        } else if (!builtin(args)) {
+        if (has_pipe(args))
+            execute_pipeline(args);
+        else if (!builtin(args))
             execute(args);
-        }
     }
-
     return 0;
 }
